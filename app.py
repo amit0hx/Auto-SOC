@@ -15,6 +15,22 @@ try:
 except Exception:
     LIVE_CAPTURE_AVAILABLE = False
 
+# Explainability (SHAP) is optional — degrades to a rule-based explanation.
+try:
+    from explain import explain_prediction
+    EXPLAIN_AVAILABLE = True
+except Exception:
+    EXPLAIN_AVAILABLE = False
+
+# Threat-intelligence lookup (AbuseIPDB; offline fallback if no key).
+try:
+    import threat_intel
+    THREAT_INTEL_AVAILABLE = True
+except Exception:
+    THREAT_INTEL_AVAILABLE = False
+
+FEEDBACK_FILE = "feedback_log.csv"
+
 # ─── Page Config ───
 st.set_page_config(
     page_title="Auto-SOC Dashboard",
@@ -316,6 +332,7 @@ def analyze_packet(sample_row):
         "severity_color": severity["color"],
         "log_data": log_dict,
         "correct": prediction == actual_label,
+        "encoded_row": sample_proc,
     }
 
     # Update session state counters
@@ -369,6 +386,21 @@ if simulate_one:
                 f'</div>',
                 unsafe_allow_html=True
             )
+
+        # Why was this flagged? (SHAP explainability)
+        if result["prediction"] != "Normal" and EXPLAIN_AVAILABLE:
+            with st.spinner("Explaining decision (SHAP)…"):
+                exp = explain_prediction(model, result["encoded_row"],
+                                         result["log_data"], result["prediction"])
+            st.markdown(f"**🔍 Why flagged?** <span style='color:#8b95a5;font-size:0.8rem'>"
+                        f"({exp['method']})</span>", unsafe_allow_html=True)
+            for d in exp["drivers"]:
+                if d["impact"] is not None:
+                    st.markdown(
+                        f"- `{d['feature']} = {d['value']}` — **{d['direction']}** the probability "
+                        f"of {result['prediction']} (impact {d['impact']:+})")
+                else:
+                    st.markdown(f"- `{d['feature']} = {d['value']}` — key feature")
 
     with col_response:
         st.markdown("### 🤖 SOC Analyst Response")
@@ -472,24 +504,33 @@ else:
                     if _ORDER.get(sev["level"], 0) > _ORDER.get(s["sev"], 0):
                         s["sev"] = sev["level"]
 
-            # Build the ranked source table (resolve rDNS once, now).
+            # Build the ranked source table (resolve rDNS + threat intel once, now).
             src_rows = []
             for ip, s in sorted(sources.items(), key=lambda kv: kv[1]["flows"], reverse=True):
                 host = _rdns(ip) if s["origin"] == "EXTERNAL" else "—"
+                ti = threat_intel.badge(threat_intel.check_ip(ip)) if THREAT_INTEL_AVAILABLE else "—"
                 src_rows.append({
                     "Source IP": ip, "Origin": s["origin"], "Severity": s["sev"],
                     "Attack Flows": s["flows"], "Attack Types": ", ".join(sorted(s["types"])),
-                    "Reverse-DNS": host,
+                    "Reverse-DNS": host, "Threat Intel": ti,
                 })
 
-            # Auto-generate an IR playbook for the #1 attacker's worst attack type.
-            top_info, top_pb = None, None
+            # Auto-generate an IR playbook + SHAP explanation for the #1 attacker.
+            top_info, top_pb, top_why = None, None, None
             if sources:
                 top_ip, top = max(sources.items(), key=lambda kv: kv[1]["flows"])
                 worst = max(top["types"], key=lambda t: _ORDER.get(get_severity(t)["level"], 0))
                 log = next(({c: f[c] for c in FEATURE_COLS}
                             for f, p in results if f["_src"] == top_ip and p == worst), None)
                 if log is not None:
+                    if EXPLAIN_AVAILABLE:
+                        enc_row = pd.DataFrame([log])[FEATURE_COLS].copy()
+                        for col in ("protocol_type", "service", "flag"):
+                            try:
+                                enc_row[col] = encoders[col].transform(enc_row[col])
+                            except Exception:
+                                enc_row[col] = 0
+                        top_why = explain_prediction(model, enc_row, log, worst)["text"]
                     with st.spinner(f"Generating IR playbook for top attacker {top_ip}…"):
                         pb = generate_ir_playbook(log, worst)
                     top_pb = pb.replace("<SRC_IP>", top_ip)
@@ -498,7 +539,8 @@ else:
 
             st.session_state.lc = {
                 "all_rows": all_rows, "n_attacks": len(attack_rows),
-                "src_rows": src_rows, "top_info": top_info, "top_pb": top_pb,
+                "src_rows": src_rows, "top_info": top_info,
+                "top_pb": top_pb, "top_why": top_why,
             }
 
     # ── Render results (persisted, so playbook stays on reruns) ──
@@ -526,6 +568,8 @@ else:
                     f'{ti["type"]} — {ti["flows"]} attack flow(s) toward this host</div>',
                     unsafe_allow_html=True,
                 )
+                if lc.get("top_why"):
+                    st.markdown(f"**🔍 Why flagged?** {lc['top_why']}")
                 st.markdown("#### 🤖 Auto-Generated IR Playbook (for the top attacker)")
                 st.markdown(lc["top_pb"])
         else:
@@ -555,6 +599,20 @@ if st.session_state.attack_history:
     history_df = pd.DataFrame(history_data)
     st.dataframe(history_df, use_container_width=True, hide_index=True)
 
+    # ── Detection Timeline (severity over time, coloured by attack type) ──
+    st.markdown("#### 📈 Detection Timeline")
+    _sev_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "INFO": 1}
+    try:
+        timeline_df = pd.DataFrame([{
+            "Time": pd.to_datetime(e["timestamp"], format="%H:%M:%S"),
+            "Severity": _sev_rank.get(e["severity"], 1),
+            "Type": e["prediction"],
+        } for e in reversed(st.session_state.attack_history)])
+        st.scatter_chart(timeline_df, x="Time", y="Severity", color="Type", height=260)
+        st.caption("Higher = more severe (4=CRITICAL, 1=INFO). Each point is one analysed connection.")
+    except Exception:
+        st.line_chart(pd.Series(range(1, len(st.session_state.attack_history) + 1)))
+
     # Attack distribution pie chart from session history
     if st.session_state.attack_count > 0:
         st.markdown("#### 🥧 Session Attack Distribution")
@@ -562,6 +620,37 @@ if st.session_state.attack_history:
         if attack_entries:
             attack_series = pd.Series([e["prediction"] for e in attack_entries]).value_counts()
             st.bar_chart(attack_series, color="#ef4444")
+
+    # ── Analyst Feedback Loop (label detections for future retraining) ──
+    st.markdown("#### 🔁 Analyst Feedback Loop")
+    latest = st.session_state.attack_history[0]
+    st.caption(f"Latest detection: **{latest['prediction']}** ({latest['severity']}) at {latest['timestamp']}")
+
+    def _log_feedback(entry, verdict):
+        import csv
+        new = not os.path.exists(FEEDBACK_FILE)
+        with open(FEEDBACK_FILE, "a", newline="") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["time", "prediction", "actual", "analyst_verdict"])
+            w.writerow([entry["timestamp"], entry["prediction"], entry.get("actual", "-"), verdict])
+
+    fb1, fb2 = st.columns(2)
+    if fb1.button("✅ Correct detection", use_container_width=True):
+        _log_feedback(latest, "correct")
+        st.success("Feedback logged — confirms the model.")
+    if fb2.button("❌ False positive", use_container_width=True):
+        _log_feedback(latest, "false_positive")
+        st.warning("Logged as false positive — flagged for the retraining set.")
+
+    if os.path.exists(FEEDBACK_FILE):
+        try:
+            fb = pd.read_csv(FEEDBACK_FILE)
+            counts = fb["analyst_verdict"].value_counts().to_dict()
+            st.caption(f"📊 Feedback collected: {counts} · saved to `{FEEDBACK_FILE}` "
+                       f"for periodic model re-training (closing the SOC loop).")
+        except Exception:
+            pass
 
     # Clear history button
     if st.button("🗑️ Clear History"):

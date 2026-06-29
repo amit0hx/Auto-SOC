@@ -7,3 +7,4 @@ joblib
 google-generativeai
 python-dotenv
 scapy
+shap
